@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -143,7 +144,7 @@ def s3_delete_many(s3_client, bucket: str, keys: list[str]) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="Quick S3 micro-benchmark (~1 minute)")
-    ap.add_argument("--bucket", required=True)
+    ap.add_argument("--bucket", default=None)
     ap.add_argument("--prefix", default="bench/microbench")
     ap.add_argument("--keys", type=int, default=16, help="number of objects")
     ap.add_argument("--obj-mib", type=int, default=8, help="object size in MiB")
@@ -154,8 +155,16 @@ def main():
     ap.add_argument("--range-reads-per-obj", type=int, default=0, help="if >0, do random range reads")
     ap.add_argument("--range-kib", type=int, default=256, help="range size KiB")
     ap.add_argument("--local-dir", default=None, help="directory for generated local files (default: /tmp/s3_microbench_<obj-mib>MiB)")
+    ap.add_argument("--create-only", action="store_true", help="only create local files, skip all S3 operations")
+    ap.add_argument("--upload-only", action="store_true", help="only upload existing local files to S3, skip file creation")
     ap.add_argument("--keep", action="store_true", help="keep uploaded objects (no cleanup)")
     args = ap.parse_args()
+
+    if args.create_only and args.upload_only:
+        ap.error("--create-only and --upload-only are mutually exclusive")
+
+    if not args.create_only and not args.bucket:
+        ap.error("--bucket is required for S3 operations")
 
     bucket = args.bucket
     prefix = args.prefix.rstrip("/")
@@ -167,35 +176,53 @@ def main():
     part_size = args.part_mib * 1024 * 1024
     read_chunk = args.read_chunk_kib * 1024
     range_size = args.range_kib * 1024
+    max_conc = args.max_concurrency
 
+    local_dir = args.local_dir or f"/tmp/s3_microbench_{args.obj_mib}MiB"
+
+    # --- Create local files (skip if --upload-only) ---
+    if args.upload_only:
+        local_paths = [os.path.join(local_dir, f"obj_{i:05d}.bin") for i in range(args.keys)]
+        missing = [p for p in local_paths if not os.path.exists(p)]
+        if missing:
+            print(f"ERROR: --upload-only but {len(missing)} file(s) missing in {local_dir}/", file=sys.stderr)
+            for p in missing[:5]:
+                print(f"  {p}", file=sys.stderr)
+            if len(missing) > 5:
+                print(f"  ... and {len(missing) - 5} more", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"Using {len(local_paths)} existing files from {local_dir}/")
+    else:
+        print(f"Generating {args.keys} local files in {local_dir}/ size={args.obj_mib}MiB chunk={args.write_chunk_kib}KiB")
+        t0 = now()
+        local_paths = gen_local_files(local_dir, args.keys, obj_bytes, write_chunk)
+        t1 = now()
+        total_gen = obj_bytes * args.keys
+        gen_secs = t1 - t0
+        print(f"Local gen: {total_gen/(1024*1024):.1f} MiB in {gen_secs:.3f}s ({(total_gen/(1024*1024))/gen_secs:.1f} MiB/s)")
+
+    if args.create_only:
+        print(f"\n--create-only: done. Files in {local_dir}/")
+        return
+
+    # --- S3 operations ---
     # boto3 clients are thread-safe; one client is sufficient for all operations.
     s3 = boto3.client("s3")
 
-    # Local files — one per key so each upload is unique
-    local_dir = args.local_dir or f"/tmp/s3_microbench_{args.obj_mib}MiB"
-    print(f"Generating {args.keys} local files in {local_dir}/ size={args.obj_mib}MiB chunk={args.write_chunk_kib}KiB")
-    t0 = now()
-    local_paths = gen_local_files(local_dir, args.keys, obj_bytes, write_chunk)
-    t1 = now()
-    total_gen = obj_bytes * args.keys
-    gen_secs = t1 - t0
-    print(f"Local gen: {total_gen/(1024*1024):.1f} MiB in {gen_secs:.3f}s ({(total_gen/(1024*1024))/gen_secs:.1f} MiB/s)")
-
     # Upload
-    print(f"\nUploading: keys={args.keys}, part={args.part_mib}MiB, concurrency={args.max_concurrency}")
+    print(f"\nUploading: keys={args.keys}, part={args.part_mib}MiB, concurrency={max_conc}")
     put_stats = s3_upload_many(
         s3,
         bucket=bucket,
         keys=keys,
         local_paths=local_paths,
         part_size=part_size,
-        max_conc=args.max_concurrency,
+        max_conc=max_conc,
     )
     print(f"{put_stats.label}: {put_stats.mib:.1f} MiB in {put_stats.seconds:.3f}s = {put_stats.mib_per_s:.1f} MiB/s")
 
     # Download streaming
     print(f"\nDownloading (stream): read_chunk={args.read_chunk_kib}KiB")
-    max_conc = args.max_concurrency
     get_stats = s3_download_many(s3, bucket=bucket, keys=keys, read_chunk=read_chunk, max_conc=max_conc)
     print(f"{get_stats.label}: {get_stats.mib:.1f} MiB in {get_stats.seconds:.3f}s = {get_stats.mib_per_s:.1f} MiB/s")
 
