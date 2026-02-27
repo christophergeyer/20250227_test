@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -33,37 +34,46 @@ def gen_object_keys(prefix: str, n: int) -> list[str]:
     return [f"{prefix}/obj_{i:05d}.bin" for i in range(n)]
 
 
-def write_local_file(path: str, size_bytes: int, chunk_bytes: int) -> None:
+def write_local_file(path: str, size_bytes: int, chunk_bytes: int, seed: int = 0xC0FFEE) -> None:
     # Avoid /dev/urandom cost; use PRNG-filled blocks.
     # High variability is OK; we just need relative comparisons.
-    rnd = random.Random(0xC0FFEE)
+    rnd = random.Random(seed)
     with open(path, "wb", buffering=0) as f:
         remaining = size_bytes
         while remaining > 0:
             n = min(chunk_bytes, remaining)
-            # build a block quickly; not cryptographically random
-            block = bytes(rnd.getrandbits(8) for _ in range(n))
+            block = rnd.randbytes(n)
             f.write(block)
             remaining -= n
 
 
-def s3_upload_many(s3, bucket: str, keys: list[str], local_path: str, part_size: int, max_conc: int) -> Stats:
+def gen_local_files(dir_path: str, count: int, size_bytes: int, chunk_bytes: int) -> list[str]:
+    """Generate `count` distinct local files, each with a different PRNG seed."""
+    os.makedirs(dir_path, exist_ok=True)
+    paths = []
+    for i in range(count):
+        p = os.path.join(dir_path, f"obj_{i:05d}.bin")
+        write_local_file(p, size_bytes, chunk_bytes, seed=0xC0FFEE + i)
+        paths.append(p)
+    return paths
+
+
+def s3_upload_many(s3, bucket: str, keys: list[str], local_paths: list[str], part_size: int, max_conc: int) -> Stats:
     cfg = TransferConfig(
         multipart_threshold=part_size,  # force multipart at/above part_size
         multipart_chunksize=part_size,
         max_concurrency=max_conc,
         use_threads=True,
     )
-    file_size = os.path.getsize(local_path)
 
-    def _upload_one(key: str) -> int:
-        s3.upload_file(local_path, bucket, key, Config=cfg)
-        return file_size
+    def _upload_one(key: str, path: str) -> int:
+        s3.upload_file(path, bucket, key, Config=cfg)
+        return os.path.getsize(path)
 
     t0 = now()
     total = 0
     with ThreadPoolExecutor(max_workers=max_conc) as pool:
-        futures = [pool.submit(_upload_one, k) for k in keys]
+        futures = [pool.submit(_upload_one, k, p) for k, p in zip(keys, local_paths)]
         for f in as_completed(futures):
             total += f.result()
     t1 = now()
@@ -160,14 +170,15 @@ def main():
     # boto3 clients are thread-safe; one client is sufficient for all operations.
     s3 = boto3.client("s3")
 
-    # Local file
-    local_path = f"/tmp/s3_microbench_{args.obj_mib}MiB.bin"
-    print(f"Generating local file: {local_path} size={args.obj_mib}MiB chunk={args.write_chunk_kib}KiB")
+    # Local files — one per key so each upload is unique
+    local_dir = f"/tmp/s3_microbench_{args.obj_mib}MiB"
+    print(f"Generating {args.keys} local files in {local_dir}/ size={args.obj_mib}MiB chunk={args.write_chunk_kib}KiB")
     t0 = now()
-    write_local_file(local_path, obj_bytes, write_chunk)
+    local_paths = gen_local_files(local_dir, args.keys, obj_bytes, write_chunk)
     t1 = now()
+    total_gen = obj_bytes * args.keys
     gen_secs = t1 - t0
-    print(f"Local gen: {obj_bytes/(1024*1024):.1f} MiB in {gen_secs:.3f}s ({(obj_bytes/(1024*1024))/gen_secs:.1f} MiB/s)")
+    print(f"Local gen: {total_gen/(1024*1024):.1f} MiB in {gen_secs:.3f}s ({(total_gen/(1024*1024))/gen_secs:.1f} MiB/s)")
 
     # Upload
     print(f"\nUploading: keys={args.keys}, part={args.part_mib}MiB, concurrency={args.max_concurrency}")
@@ -175,7 +186,7 @@ def main():
         s3,
         bucket=bucket,
         keys=keys,
-        local_path=local_path,
+        local_paths=local_paths,
         part_size=part_size,
         max_conc=args.max_concurrency,
     )
@@ -200,16 +211,12 @@ def main():
 
     # Cleanup
     if args.keep:
-        print("\nKeeping objects (no cleanup).")
+        print(f"\nKeeping objects (no cleanup). Local files in {local_dir}/")
     else:
-        print("\nCleaning up uploaded objects...")
+        print("\nCleaning up uploaded objects and local files...")
         s3_delete_many(s3, bucket=bucket, keys=keys)
+        shutil.rmtree(local_dir, ignore_errors=True)
         print("Cleanup done.")
-
-    try:
-        os.remove(local_path)
-    except OSError:
-        pass
 
 
 if __name__ == "__main__":
