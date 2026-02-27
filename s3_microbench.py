@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--max-concurrency", type=int, default=4, help="multipart concurrency")
     ap.add_argument("--range-reads-per-obj", type=int, default=0, help="if >0, do random range reads")
     ap.add_argument("--range-kib", type=int, default=256, help="range size KiB")
+    ap.add_argument("--local-dir", default=None, help="directory for generated local files (default: /tmp/s3_microbench_<obj-mib>MiB)")
     ap.add_argument("--keep", action="store_true", help="keep uploaded objects (no cleanup)")
     args = ap.parse_args()
 
@@ -171,7 +172,7 @@ def main():
     s3 = boto3.client("s3")
 
     # Local files — one per key so each upload is unique
-    local_dir = f"/tmp/s3_microbench_{args.obj_mib}MiB"
+    local_dir = args.local_dir or f"/tmp/s3_microbench_{args.obj_mib}MiB"
     print(f"Generating {args.keys} local files in {local_dir}/ size={args.obj_mib}MiB chunk={args.write_chunk_kib}KiB")
     t0 = now()
     local_paths = gen_local_files(local_dir, args.keys, obj_bytes, write_chunk)
